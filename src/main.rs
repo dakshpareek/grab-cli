@@ -1,4 +1,5 @@
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::File;
 use std::io::Read;
 use std::io::{self, Write};
@@ -46,9 +47,12 @@ fn main() -> anyhow::Result<()> {
 
     let mut response = client.get(url).send()?.error_for_status()?; // If we reach here, status is 2xx success
     let content_length = response.content_length();
-    if let Some(len) = content_length {
-        println!("Content-Length: {len}");
-    }
+    let bar = ProgressBar::new(content_length.unwrap_or(0));
+    bar.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
+            .progress_chars("#>-"),
+    );
 
     let mut buffer = [0u8; 64000];
     let mut total_bytes: usize = 0;
@@ -63,10 +67,12 @@ fn main() -> anyhow::Result<()> {
         }
         file.write_all(&buffer[..bytes_read])?;
         total_bytes += bytes_read;
+        bar.inc(bytes_read as u64);
         // Improved progress: In-place update
         print!("\rProcessed: {total_bytes} bytes");
         io::stdout().flush().unwrap();
     }
+    bar.finish();
 
     if total_bytes as u64 != content_length.unwrap_or(0) {
         println!("Warning: Downloaded size does not match Content-Length header");
@@ -76,10 +82,10 @@ fn main() -> anyhow::Result<()> {
         println!("Warning: No data downloaded");
     }
 
-    println!(
-        "\nDownload complete {}! Total size: {} bytes",
-        filename, total_bytes
-    );
+    // println!(
+    //     "\nDownload complete {}! Total size: {} bytes",
+    //     filename, total_bytes
+    // );
 
     Ok(())
 }
