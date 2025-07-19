@@ -1,0 +1,11 @@
+[package]
+name = "dlm_head"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.11", default-features = false, features = [
+    "blocking",
+    "rustls-tls",
+] }
+anyhow = "1.0"
