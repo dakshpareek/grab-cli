@@ -1,6 +1,13 @@
+use clap::Parser;
 use std::fs::File;
 use std::io::Read;
 use std::io::{self, Write};
+
+#[derive(Parser)]
+#[command(author, version, about)]
+struct Cli {
+    url: String,
+}
 
 fn get_filename(response: &reqwest::blocking::Response) -> String {
     if let Some(cd_val) = response.headers().get(reqwest::header::CONTENT_DISPOSITION) {
@@ -27,7 +34,11 @@ fn get_filename(response: &reqwest::blocking::Response) -> String {
 }
 
 fn main() -> anyhow::Result<()> {
-    let url = "https://freetestdata.com/wp-content/uploads/2024/01/sample-zip.rar";
+    let cli = Cli::parse();
+
+    // let url = "https://freetestdata.com/wp-content/uploads/2024/01/sample-zip.rar";
+
+    let url = &cli.url;
 
     let client = reqwest::blocking::Client::builder()
         .user_agent("dlm-head") // Sets the default User-Agent header for all requests
