@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use tokio::{
     fs::{self, File, OpenOptions},
     io::AsyncWriteExt,
+    sync::mpsc::Sender,
 };
 
 fn filename_from_url(url: &str) -> String {
@@ -156,5 +157,34 @@ pub async fn download(client: &Client, url: &str) -> Result<()> {
 
     download_and_update_progress(&bar, &mut file, response).await?;
 
+    Ok(())
+}
+
+pub async fn download_with_progress(
+    client: &Client,
+    url: &str,
+    id: usize,
+    progress: Sender<ProgressBar>,
+) -> Result<()> {
+    // send Started
+    progress
+        .send(ProgressBar::Started {
+            id,
+            total: resp.content_length(),
+        })
+        .await
+        .ok();
+
+    // inside loop after bytes.len():
+    progress
+        .send(ProgressMsg::Progress {
+            id,
+            delta: bytes.len() as u64,
+        })
+        .await
+        .ok();
+
+    // on finish
+    progress.send(ProgressMsg::Finished { id }).await.ok();
     Ok(())
 }
