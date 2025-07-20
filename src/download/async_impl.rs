@@ -1,15 +1,13 @@
-use std::fs;
-use std::{
-    fs::File,
-    io::{Read, Write},
-    path::PathBuf,
-};
-
-use anyhow::{Ok, Result};
+use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{
-    blocking::Client,
     header::{HeaderMap, ACCEPT_RANGES},
+    Client, StatusCode,
+};
+use std::path::PathBuf;
+use tokio::{
+    fs::{self, File, OpenOptions},
+    io::AsyncWriteExt,
 };
 
 fn filename_from_url(url: &str) -> String {
@@ -34,8 +32,8 @@ fn filename_from_headers(headers: &HeaderMap) -> Option<String> {
         })
 }
 
-fn is_resumable(client: &Client, url: &str) -> Result<bool> {
-    let resp = client.head(url).send()?.error_for_status()?;
+async fn is_resumable(client: &Client, url: &str) -> Result<bool> {
+    let resp = client.head(url).send().await?.error_for_status()?;
     let resumable = resp
         .headers()
         .get(ACCEPT_RANGES)
@@ -70,28 +68,23 @@ fn set_progress_bar(total_length: Option<u64>) -> ProgressBar {
     }
 }
 
-fn download_and_update_progress(
+async fn download_and_update_progress(
     bar: &ProgressBar,
     file: &mut File,
-    response: &mut reqwest::blocking::Response,
+    response: reqwest::Response,
 ) -> Result<()> {
-    let mut buffer = [0u8; 64000];
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+
     let mut total_bytes: usize = 0;
-
-    loop {
-        let bytes_read = response.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
-        }
-        file.write_all(&buffer[..bytes_read])?;
-        total_bytes += bytes_read;
-        bar.inc(bytes_read as u64);
+    while let Some(item) = stream.next().await {
+        let bytes = item?; // Bytes is Sized
+        file.write_all(&bytes).await?;
+        total_bytes += bytes.len();
+        bar.inc(bytes.len() as u64);
     }
-    bar.finish();
 
-    // if total_bytes as u64 != content_length.unwrap_or(0) {
-    //     println!("Warning: Downloaded size does not match Content-Length header");
-    // }
+    bar.finish();
 
     if total_bytes == 0 {
         println!("Warning: No data downloaded");
@@ -100,56 +93,68 @@ fn download_and_update_progress(
     Ok(())
 }
 
-pub fn download(client: &Client, url: &str) -> Result<()> {
-    // First, determine our initial filename from URL
+pub async fn download(client: &Client, url: &str) -> Result<()> {
     let initial_filename = filename_from_url(url);
-    let mut path = PathBuf::from(&initial_filename);
+    let path = PathBuf::from(&initial_filename);
 
     let already = if path.exists() {
-        fs::metadata(&path)?.len()
+        fs::metadata(&path).await?.len()
     } else {
         0
     };
 
-    let mut request_builder = client.get(url);
-
-    let resumable = if already != 0 && is_resumable(client, url)? {
-        request_builder = request_builder.header("Range", format!("bytes={}-", already));
+    let resumable = if already != 0 && is_resumable(client, url).await? {
         println!("Resuming...");
         true
     } else {
         if already != 0 {
             println!("Server doesn't support resuming. Restarting download...");
-            fs::remove_file(&path)?;
+            fs::remove_file(&path).await?;
         }
         false
     };
 
-    let mut response = request_builder.send()?.error_for_status()?; // If we reach here, status is 2xx success
+    let mut request_builder = client.get(url);
+    if resumable {
+        request_builder = request_builder.header("Range", format!("bytes={}-", already));
+    }
 
-    // Naming logic: Filename from headers has priority over URL-based name
-    let fname = filename_from_headers(response.headers()).unwrap_or(initial_filename);
-    path = PathBuf::from(&fname);
+    let mut response;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        response = request_builder
+            .try_clone()
+            .unwrap()
+            .send()
+            .await?
+            .error_for_status()?;
+        if response.status() == StatusCode::OK && resumable && attempt == 1 {
+            // ...
+            request_builder = client.get(url);
+            continue;
+        }
+        break;
+    }
 
-    // Decide if we should append to existing file or create a new one
+    let fname = filename_from_headers(response.headers()).unwrap_or_else(|| filename_from_url(url));
+    let path = PathBuf::from(&fname);
+
     let mut file = if resumable {
-        fs::OpenOptions::new().append(true).open(&path)?
+        OpenOptions::new().append(true).open(&path).await?
     } else {
-        File::create(&path)?
+        File::create(&path).await?
     };
 
-    // Adjust total content length appropriately (for progress bar)
-    let total_length = match response.content_length() {
-        Some(len) if resumable => Some(already + len), // total length = already downloaded + remaining
-        Some(len) => Some(len),
-        None => None,
-    };
-
+    let total_length = response
+        .content_length()
+        .map(|len| if resumable { already + len } else { len });
     let bar = set_progress_bar(total_length);
     if resumable {
         bar.set_position(already);
     }
-    download_and_update_progress(&bar, &mut file, &mut response)?;
+
+    download_and_update_progress(&bar, &mut file, response).await?;
 
     Ok(())
 }
