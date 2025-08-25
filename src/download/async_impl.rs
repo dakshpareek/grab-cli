@@ -1,4 +1,6 @@
+use crate::download::progress::ProgressMsg;
 use anyhow::Result;
+use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{
     header::{HeaderMap, ACCEPT_RANGES},
@@ -164,27 +166,113 @@ pub async fn download_with_progress(
     client: &Client,
     url: &str,
     id: usize,
-    progress: Sender<ProgressBar>,
+    tx: Sender<ProgressMsg>,
 ) -> Result<()> {
-    // send Started
-    progress
-        .send(ProgressBar::Started {
-            id,
-            total: resp.content_length(),
-        })
-        .await
-        .ok();
+    // Determine initial filename and existing bytes (if any)
+    let initial_filename = filename_from_url(url);
+    let mut path = PathBuf::from(&initial_filename);
 
-    // inside loop after bytes.len():
-    progress
-        .send(ProgressMsg::Progress {
-            id,
-            delta: bytes.len() as u64,
-        })
-        .await
-        .ok();
+    let mut already = if path.exists() {
+        fs::metadata(&path).await?.len()
+    } else {
+        0
+    };
 
-    // on finish
-    progress.send(ProgressMsg::Finished { id }).await.ok();
+    // Check if resumable; if not resumable but partial exists, restart fresh
+    let resumable = if already != 0 && is_resumable(client, url).await? {
+        true
+    } else {
+        if already != 0 {
+            let _ = fs::remove_file(&path).await;
+            already = 0;
+        }
+        false
+    };
+
+    // Build request (with Range if resuming)
+    let mut request_builder = client.get(url);
+    if resumable && already > 0 {
+        request_builder = request_builder.header("Range", format!("bytes={}-", already));
+    }
+
+    // Notify UI that we started (we'll refine total after GET)
+    let _ = tx.send(ProgressMsg::Resumable { id, resumable }).await;
+    let _ = tx.send(ProgressMsg::Started { id, total: None }).await;
+
+    // Send request; handle servers that ignore Range (return 200 when expecting 206)
+    let mut response;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        response = request_builder
+            .try_clone()
+            .unwrap()
+            .send()
+            .await?
+            .error_for_status()?;
+        if response.status() == StatusCode::OK && resumable && attempt == 1 {
+            // server ignored Range; restart full
+            request_builder = client.get(url);
+            let _ = fs::remove_file(&path).await;
+            already = 0;
+            continue;
+        }
+        break;
+    }
+
+    // Determine final filename from headers, if provided
+    if let Some(header_name) = filename_from_headers(response.headers()) {
+        if header_name != initial_filename {
+            let new_path = PathBuf::from(&header_name);
+            if already > 0 && path.exists() {
+                // rename existing partial to match the final name so we can append
+                let _ = fs::rename(&path, &new_path).await;
+            }
+            path = new_path;
+            let display_name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or(header_name);
+            let _ = tx
+                .send(ProgressMsg::Renamed {
+                    id,
+                    file: display_name,
+                })
+                .await;
+        }
+    }
+
+    // Open file (append if resuming, create otherwise)
+    let mut file = if resumable && already > 0 {
+        OpenOptions::new().append(true).open(&path).await?
+    } else {
+        File::create(&path).await?
+    };
+
+    // Compute total for UI (total = already + remaining if resuming)
+    let total_length = response
+        .content_length()
+        .map(|len| if resumable { already + len } else { len });
+    let _ = tx
+        .send(ProgressMsg::Started {
+            id,
+            total: total_length,
+        })
+        .await;
+
+    // Stream body and report progress deltas
+    let mut stream = response.bytes_stream();
+    while let Some(item) = stream.next().await {
+        let chunk = item?;
+        file.write_all(&chunk).await?;
+        let _ = tx
+            .send(ProgressMsg::Progress {
+                id,
+                delta: chunk.len() as u64,
+            })
+            .await;
+    }
+    file.flush().await?;
+    let _ = tx.send(ProgressMsg::Finished { id }).await;
     Ok(())
 }
