@@ -26,6 +26,13 @@ cargo run -- https://speed.hetzner.de/1MB.bin
    cargo run -- https://example.com/file.zip
    ```
 
+## TUI (Interactive)
+- Run the TUI:
+  ```bash
+  cargo run --bin dlm_tui
+  ```
+- Keys: a (add URL), i (info), q (quit), ↑/↓ (select), Enter/Esc (modals)
+
 ## Why This Exists
 
 > “Learn by doing.”

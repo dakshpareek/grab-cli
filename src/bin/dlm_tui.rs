@@ -9,12 +9,12 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     prelude::*,
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
 };
-use reqwest::{header::ACCEPT_RANGES, Client};
+use reqwest::Client;
 use std::{io, time::Duration};
 use tokio::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::AsyncWriteExt,
     sync::mpsc::{self, Receiver, Sender},
 };
@@ -24,15 +24,17 @@ use tokio::{
 struct RowData {
     id: usize,
     url: String,
-    status: String,
+    status: String, // short label for table (e.g., "Running", "Done", "Error")
     done: u64,
     total: Option<u64>,
+    detail: Option<String>, // full error/details for Info modal
 }
 
 /// Application modes
 enum UiMode {
     Normal,
     Input(String), // buffer while typing a URL
+    Info(String),  // info popup text for selected row
 }
 
 /// Messages sent from download tasks back to the UI
@@ -88,6 +90,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
                     if let Some(row) = app.rows.iter_mut().find(|r| r.id == id) {
                         row.total = total;
                         row.status = "Running".into();
+                        row.detail = None;
                     }
                 }
                 ProgressMsg::Progress { id, delta } => {
@@ -98,11 +101,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
                 ProgressMsg::Finished { id } => {
                     if let Some(row) = app.rows.iter_mut().find(|r| r.id == id) {
                         row.status = "Done".into();
+                        row.detail = None;
                     }
                 }
                 ProgressMsg::Failed { id, err } => {
                     if let Some(row) = app.rows.iter_mut().find(|r| r.id == id) {
-                        row.status = format!("Err: {err}");
+                        row.status = "Error".into(); // short table label
+                        row.detail = Some(err); // full message for Info popup
                     }
                 }
             }
@@ -112,8 +117,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 match (&mut app.mode, key.code) {
-                    // Global quit
-                    (_, KeyCode::Char('q')) => break,
+                    // Close modals with q or Esc (does not quit the app)
+                    (UiMode::Input(_), KeyCode::Char('q')) | (UiMode::Input(_), KeyCode::Esc) => {
+                        app.mode = UiMode::Normal;
+                    }
+                    (UiMode::Info(_), KeyCode::Char('q')) | (UiMode::Info(_), KeyCode::Esc) => {
+                        app.mode = UiMode::Normal;
+                    }
+
+                    // Quit only in Normal mode
+                    (UiMode::Normal, KeyCode::Char('q')) => break,
 
                     // ----- NORMAL MODE -----
                     (UiMode::Normal, KeyCode::Up) => {
@@ -129,11 +142,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
                     (UiMode::Normal, KeyCode::Char('a')) => {
                         app.mode = UiMode::Input(String::new());
                     }
+                    (UiMode::Normal, KeyCode::Char('i')) => {
+                        if let Some(r) = app.rows.get(app.selected) {
+                            let text = format_info_text(r);
+                            app.mode = UiMode::Info(text);
+                        }
+                    }
 
                     // ----- INPUT MODE -----
-                    (UiMode::Input(buf), KeyCode::Esc) => {
-                        app.mode = UiMode::Normal;
-                    }
                     (UiMode::Input(buf), KeyCode::Backspace) => {
                         buf.pop();
                     }
@@ -152,6 +168,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
                                 status: "Queued".into(),
                                 done: 0,
                                 total: None,
+                                detail: None,
                             });
                         }
                         app.mode = UiMode::Normal;
@@ -171,7 +188,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Resul
 /// Spawns an async task that performs the download and reports progress
 fn spawn_download_task(id: usize, url: String, tx: Sender<ProgressMsg>) {
     tokio::spawn(async move {
-        let client = Client::new();
+        let client = Client::builder()
+            .user_agent("grab-cli")
+            .build()
+            .expect("http client");
         if let Err(e) = download_with_progress(&client, &url, id, tx.clone()).await {
             let _ = tx
                 .send(ProgressMsg::Failed {
@@ -190,19 +210,38 @@ async fn download_with_progress(
     id: usize,
     tx: Sender<ProgressMsg>,
 ) -> Result<()> {
-    // HEAD to get total length and resumable flag
-    let total = client
-        .head(url)
-        .send()
-        .await?
-        .headers()
-        .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
+    // 1) HEAD is best-effort; some servers reject or omit Content-Length
+    let head_total = match client.head(url).send().await {
+        Ok(resp) => resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok()),
+        Err(_) => None,
+    };
+    // Notify UI with whatever we know so far
+    let _ = tx
+        .send(ProgressMsg::Started {
+            id,
+            total: head_total,
+        })
+        .await;
 
-    let _ = tx.send(ProgressMsg::Started { id, total }).await;
+    // 2) GET the body
+    let resp = client.get(url).send().await?.error_for_status()?;
 
-    let mut resp = client.get(url).send().await?.error_for_status()?;
+    // 3) If GET reveals a Content-Length differing from HEAD, update UI
+    let get_total = resp.content_length();
+    if get_total.is_some() && get_total != head_total {
+        let _ = tx
+            .send(ProgressMsg::Started {
+                id,
+                total: get_total,
+            })
+            .await;
+    }
+
+    // 4) Stream body to file and emit progress deltas
     let mut file = File::create(filename_from_url(url)).await?;
     let mut stream = resp.bytes_stream();
 
@@ -216,40 +255,43 @@ async fn download_with_progress(
             })
             .await;
     }
+
     file.flush().await?;
     let _ = tx.send(ProgressMsg::Finished { id }).await;
     Ok(())
 }
 
-/// Draws the entire interface for current state
+/// Draws the interface without a top header or downloads block.
+/// Adds a bottom "Hints" bar. Columns: File | Status | Progress.
 fn draw_ui(f: &mut Frame<'_>, app: &App) {
     let size = f.size();
 
-    // Layout split: header (3 rows) + table
+    // Layout split: table + hints (no header)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(size);
 
-    // Header block
-    let header = Block::default()
-        .title("DLM  (q=quit, a=add url)")
-        .borders(Borders::ALL);
-    f.render_widget(header, chunks[0]);
-
-    // Table rows
+    // Build table rows
     let table_rows: Vec<Row> = app
         .rows
         .iter()
         .enumerate()
         .map(|(idx, r)| {
-            let pct = r.total.map(|t| r.done * 100 / t).unwrap_or(0);
+            let file_name = filename_from_url(&r.url);
+            let prog_text = match r.total {
+                Some(t) if t > 0 => {
+                    let pct = r.done.saturating_mul(100) / t;
+                    format!("{pct}%")
+                }
+                _ => human_bytes(r.done),
+            };
+
             let base = Row::new(vec![
-                Cell::from(r.id.to_string()),
-                Cell::from(r.url.as_str()),
+                Cell::from(file_name),
                 Cell::from(r.status.as_str()),
-                Cell::from(format!("{pct}%")),
+                Cell::from(prog_text),
             ]);
             if idx == app.selected {
                 base.style(Style::default().bg(Color::Blue))
@@ -259,25 +301,43 @@ fn draw_ui(f: &mut Frame<'_>, app: &App) {
         })
         .collect();
 
+    // Minimalist table: only header row, no borders/block
     let widths = [
-        Constraint::Length(4),
-        Constraint::Percentage(50),
+        Constraint::Percentage(70),
         Constraint::Length(12),
-        Constraint::Length(8),
+        Constraint::Length(10),
     ];
-    let table = Table::new(table_rows, widths)
-        .header(
-            Row::new(vec!["ID", "URL", "Status", "Prog"]).style(Style::default().fg(Color::Yellow)),
-        )
-        .block(Block::default().borders(Borders::ALL).title("Downloads"));
-    f.render_widget(table, chunks[1]);
+    let table = Table::new(table_rows, widths).header(
+        Row::new(vec!["File", "Status", "Progress"]).style(Style::default().fg(Color::Yellow)),
+    );
+    f.render_widget(table, chunks[0]);
 
-    // Input prompt overlay
+    // Bottom hints bar
+    let hints_text = "a: Add URL   i: Info   q: Quit   ↑/↓: Select row   Enter/Esc: Modals";
+    let hints =
+        Paragraph::new(hints_text).block(Block::default().title("Hints").borders(Borders::ALL));
+    f.render_widget(hints, chunks[1]);
+
+    // Info popup overlay
+    if let UiMode::Info(ref text) = app.mode {
+        let area = centered_rect(70, 10, size);
+        let info = Paragraph::new(text.as_str())
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title("Info (q/Esc to close)")
+                    .borders(Borders::ALL),
+            );
+        f.render_widget(Clear, area);
+        f.render_widget(info, area);
+    }
+
+    // Add URL overlay
     if let UiMode::Input(ref buf) = app.mode {
         let area = centered_rect(60, 3, size);
         let prompt = Paragraph::new(buf.as_str())
             .block(Block::default().title("Add URL").borders(Borders::ALL));
-        f.render_widget(Clear, area); // clear beneath
+        f.render_widget(Clear, area);
         f.render_widget(prompt, area);
     }
 }
@@ -304,7 +364,53 @@ fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
     horizontal[1]
 }
 
-/// Simple helper reused from download module
+/// Safer filename helper for display and saving
 fn filename_from_url(url: &str) -> String {
-    url.split('/').last().unwrap_or("download.bin").to_string()
+    // Strip fragment and query, trim trailing slash, take last path segment
+    let base = url.split('#').next().unwrap_or(url);
+    let base = base.split('?').next().unwrap_or(base);
+    let base = base.trim_end_matches('/');
+    let seg = base.rsplit('/').next().unwrap_or("");
+    if seg.is_empty() {
+        "download.bin".to_string()
+    } else {
+        seg.to_string()
+    }
+}
+
+fn human_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let x = n as f64;
+    if x >= GB {
+        format!("{:.1} GiB", x / GB)
+    } else if x >= MB {
+        format!("{:.1} MiB", x / MB)
+    } else if x >= KB {
+        format!("{:.1} KiB", x / KB)
+    } else {
+        format!("{} B", n)
+    }
+}
+
+/// Formats the text for the Info popup
+fn format_info_text(r: &RowData) -> String {
+    let file_name = filename_from_url(&r.url);
+    let prog_line = match (r.done, r.total) {
+        (done, Some(t)) if t > 0 => {
+            let pct = done.saturating_mul(100) / t;
+            format!("Progress: {} / {} bytes ({}%)", done, t, pct)
+        }
+        (done, _) => format!("Progress: {} bytes (total unknown)", done),
+    };
+
+    if let Some(detail) = &r.detail {
+        format!(
+            "File: {}\nStatus: {}\n\nFull error:\n{}",
+            file_name, r.status, detail
+        )
+    } else {
+        format!("File: {}\nStatus: {}\n{}", file_name, r.status, prog_line)
+    }
 }
